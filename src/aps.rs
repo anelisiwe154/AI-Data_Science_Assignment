@@ -231,7 +231,6 @@ pub fn parse_marks(question: &str) -> Vec<(String, f32)> {
         ("economics", "economics"),
         ("history", "history"),
         ("tourism", "tourism"),
-        ("cat", "cat"),
         ("it", "it"),
     ];
     let mut marks = Vec::new();
@@ -249,13 +248,10 @@ pub fn parse_marks(question: &str) -> Vec<(String, f32)> {
                 break;
             }
         }
-        if key.is_empty() || key == "skip" {
-            if raw.len() > 3 && !raw.contains("got") && !raw.contains("have") && !raw.contains("course") {
-                key = raw;
-            } else {
+        if key.is_empty() || key == "skip" { 
                 continue;
             }
-        }
+    
         if !marks.iter().any(|(k, _)| k == &key) {
             marks.push((key, pct));
         }

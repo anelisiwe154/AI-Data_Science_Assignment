@@ -3,6 +3,7 @@ mod chat;
 mod course_info;
 mod loader;
 mod rag;
+mod generator;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

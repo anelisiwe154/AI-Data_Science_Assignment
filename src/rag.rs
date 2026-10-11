@@ -12,10 +12,14 @@ use crate::course_info::{
 };
 
 use crate::loader::load_prospectus_text;
+use crate::generator::generate_answer;
 #[derive(Clone, Debug)]
 pub struct Chunk {
     pub id: usize,
     pub title: String,
+    pub section: String,
+    pub page: Option<usize>,
+    pub source: String,
     pub text: String,
 }
 
@@ -30,7 +34,7 @@ pub struct RagIndex {
 impl RagIndex {
     pub fn load() -> Self {
         let (text, source) = load_prospectus_text();
-        let chunks = chunk_document(&text);
+        let chunks = chunk_document(&text, &source);
         let mut df: HashMap<String, usize> = HashMap::new();
         let mut total_len = 0usize;
         for chunk in &chunks {
@@ -65,11 +69,16 @@ impl RagIndex {
             return "The 2027 prospectus could not be loaded. Keep 2027-Prospectus-080526.docx in the CHATBOX_CPUT_PROSPECTUS folder.".to_string();
         }
 
-       let marks = parse_marks(q);
+let marks = parse_marks(q);
 
-// APS CALCULATOR PAGE
+// APS CALCULATOR: calculate APS from supplied marks
 if q.to_lowercase().starts_with("calculate my aps:") {
     return calculate_aps_only(&marks);
+}
+
+// APS HOW-TO: explain how the APS is calculated
+if looks_like_aps_howto(q) {
+    return format_aps_howto();
 }
 
 // COURSE CHECKER LANDING PAGE
@@ -102,11 +111,13 @@ Please check the qualification name and try again.",
         );
     }
 
-    return synthesize_course_information(
-        course_query,
-        &hits,
-        &self.source,
-    );
+    return match generate_answer(course_query, &hits) {
+        Ok(answer) => format_with_sources(&answer, &hits, &self.source),
+        Err(error) => format!(
+            "The prospectus passages were retrieved, but Ollama could not generate an answer.\n\n{}",
+            error
+        ),
+    };
 }
         let matched = match_programmes(q, &self.programmes);
         if !matched.is_empty() {
@@ -117,94 +128,178 @@ Please check the qualification name and try again.",
                 .join("\n\n--------------------\n\n");
         }
 
-        let hits = self.retrieve(&expand_query(q), 5);
+        let hits = self.retrieve(&expand_query(q), 12);
         if hits.is_empty() {
             return "I could not find that in the indexed 2027 CPUT prospectus. Try a qualification name, APS, application steps, fees, or a faculty.".to_string();
         }
 
-        synthesize(q, &hits, &self.source)
+        match generate_answer(q, &hits) {
+            Ok(answer) => format_with_sources(&answer, &hits, &self.source),
+            Err(error) => format!(
+                "The prospectus passages were retrieved, but Ollama could not generate an answer.\n\n{}",
+                error
+            ),
+        }
     }
 
-    fn retrieve(&self, question: &str, k: usize) -> Vec<(f32, &Chunk)> {
-        let q_tokens = tokenize(question);
-        if q_tokens.is_empty() {
-            return Vec::new();
+    
+fn retrieve(&self, question: &str, k: usize) -> Vec<(f32, &Chunk)> {
+    let q_tokens = tokenize(question);
+
+    if q_tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let question_lower = question.to_lowercase();
+
+    // Identify broad admission questions, while preserving
+    // qualification-specific searches.
+    let has_specific_qualification = self.programmes.iter().any(|p| {
+        let name = p.name.to_lowercase();
+        !name.is_empty() && question_lower.contains(&name)
+    }) || question_lower.contains("diploma in ")
+      || question_lower.contains("bachelor of ")
+      || question_lower.contains("higher certificate in ")
+      || question_lower.contains("advanced diploma in ");
+
+    let broad_admission_query =
+        !has_specific_qualification
+        && (question_lower.contains("general admission")
+            || question_lower.contains("minimum admission")
+            || question_lower.contains("entry requirements")
+            || question_lower.contains("admission requirements"));
+
+    let n = self.chunks.len() as f32;
+    let mut scored: Vec<(f32, &Chunk)> = Vec::new();
+
+    for chunk in &self.chunks {
+        let tokens = tokenize(&chunk.text);
+
+        if tokens.is_empty() {
+            continue;
         }
-        let n = self.chunks.len() as f32;
-        let mut scored: Vec<(f32, &Chunk)> = Vec::new();
-        for chunk in &self.chunks {
-            let tokens = tokenize(&chunk.text);
-            if tokens.is_empty() {
+
+        let mut tf: HashMap<&str, f32> = HashMap::new();
+
+        for t in &tokens {
+            *tf.entry(t.as_str()).or_insert(0.0) += 1.0;
+        }
+
+        let dl = tokens.len() as f32;
+        let mut score = 0.0f32;
+        let k1 = 1.5f32;
+        let b = 0.75f32;
+
+        for qt in &q_tokens {
+            let f = *tf.get(qt.as_str()).unwrap_or(&0.0);
+
+            if f == 0.0 {
                 continue;
             }
-            let mut tf: HashMap<&str, f32> = HashMap::new();
-            for t in &tokens {
-                *tf.entry(t.as_str()).or_insert(0.0) += 1.0;
-            }
-            let dl = tokens.len() as f32;
-            let mut score = 0.0f32;
-            let k1 = 1.5f32;
-            let b = 0.75f32;
-            for qt in &q_tokens {
-                let f = *tf.get(qt.as_str()).unwrap_or(&0.0);
-                if f == 0.0 {
-                    continue;
-                }
-                let df = *self.df.get(qt).unwrap_or(&0) as f32;
-                let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln().max(0.0);
-                let denom = f + k1 * (1.0 - b + b * (dl / self.avg_len.max(1.0)));
-                score += idf * (f * (k1 + 1.0)) / denom;
-                if chunk.title.to_lowercase().contains(qt) {
-                    score += 1.2;
-                }
-            }
-            if score > 0.4 {
-                scored.push((score, chunk));
+
+            let df = *self.df.get(qt).unwrap_or(&0) as f32;
+            let idf =
+                ((n - df + 0.5) / (df + 0.5) + 1.0)
+                    .ln()
+                    .max(0.0);
+
+            let denom =
+                f + k1 * (1.0 - b + b * (dl / self.avg_len.max(1.0)));
+
+            score += idf * (f * (k1 + 1.0)) / denom;
+
+            if chunk.title.to_lowercase().contains(qt.as_str()) {
+                score += 1.2;
             }
         }
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(k);
-        scored
+
+        if broad_admission_query {
+            let heading = format!("{} {}", chunk.title, chunk.section)
+                .to_lowercase();
+
+            // Prefer general admission guidance.
+            if heading.contains("general admission requirements") {
+                score += 12.0;
+            } else if heading.contains("note on minimum admission requirements")
+                || heading.contains("minimum admission requirements")
+                || heading.contains("individual subject admission requirements")
+                || heading.contains("entry requirements")
+            {
+                score += 8.0;
+            } else if heading.contains("diploma")
+                || heading.contains("bachelor")
+                || heading.contains("higher certificate")
+                || heading.contains("advanced diploma")
+                || heading.contains("faculty of")
+            {
+                // Deprioritise qualification-specific sections
+                // for questions asking about admission generally.
+                score *= 0.65;
+            }
+        }
+
+        if score > 0.4 {
+            scored.push((score, chunk));
+        }
     }
+
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    scored.truncate(k);
+    scored
 }
+   }
 
-pub fn chunk_document(text: &str) -> Vec<Chunk> {
+
+pub fn chunk_document(text: &str, source: &str) -> Vec<Chunk> {
     let header_re = Regex::new(
-        r"(?i)^(DIPLOMA|BACHELOR|HIGHER CERTIFICATE|ADVANCED DIPLOMA|BED |BHSC|BSC |HC IN|FACULTY OF|CALCULATING THE APS|METHOD [123]|ONLINE APPLICATIONS|WHAT WILL IT COST|DO YOU NEED FINANCIAL|STUDY VISAS|EARLY CLOSING|MINIMUM APS|DEPARTMENT QUALIFICATION)",
-    )
-    .unwrap();
-
+        r"(?i)^(GENERAL ADMISSION REQUIREMENTS|MINIMUM ADMISSION REQUIREMENTS|ADMISSION REQUIREMENTS|ENTRY REQUIREMENTS|NOTE ON MINIMUM ADMISSION REQUIREMENTS|INDIVIDUAL SUBJECT ADMISSION REQUIREMENTS|CALCULATING THE APS|METHOD [123]|ONLINE APPLICATIONS|WHAT WILL IT COST|DO YOU NEED FINANCIAL|STUDY VISAS|EARLY CLOSING|MINIMUM APS|DEPARTMENT QUALIFICATION|DIPLOMA|BACHELOR|HIGHER CERTIFICATE|ADVANCED DIPLOMA|BED |BHSC|BSC |HC IN|FACULTY OF)",
+    ).unwrap();
+    let page_re = Regex::new(r"^--- PAGE (\d+) ---$").unwrap();
     let mut chunks = Vec::new();
     let mut title = "CPUT Undergraduate Prospectus 2027".to_string();
+    let mut section = title.clone();
     let mut buf: Vec<String> = Vec::new();
+    let mut page: Option<usize> = None;
 
     for raw in text.lines() {
         let line = collapse(raw);
-        if line.is_empty() || is_junk(&line) {
+        if let Some(caps) = page_re.captures(&line) {
+            flush(&mut chunks, &title, &section, page, source, &mut buf);
+            page = caps.get(1).and_then(|m| m.as_str().parse::<usize>().ok());
             continue;
         }
+        if line.is_empty() || is_junk(&line) { continue; }
         if header_re.is_match(&line) && line.len() < 160 {
-            flush(&mut chunks, &title, &mut buf);
+            flush(&mut chunks, &title, &section, page, source, &mut buf);
             title = line.clone();
+            section = line.clone();
         }
         buf.push(line);
-        if buf.join(" ").len() > 900 {
-            flush(&mut chunks, &title, &mut buf);
+        if buf.join(" ").len() > 1100 {
+            flush(&mut chunks, &title, &section, page, source, &mut buf);
         }
     }
-    flush(&mut chunks, &title, &mut buf);
+    flush(&mut chunks, &title, &section, page, source, &mut buf);
     dedupe(chunks)
 }
 
-fn flush(chunks: &mut Vec<Chunk>, title: &str, buf: &mut Vec<String>) {
+fn flush(
+    chunks: &mut Vec<Chunk>, title: &str, section: &str, page: Option<usize>,
+    source: &str, buf: &mut Vec<String>,
+) {
     let text = collapse(&buf.join(" "));
     buf.clear();
-    if text.len() < 80 {
-        return;
-    }
+    if text.len() < 80 { return; }
     chunks.push(Chunk {
         id: chunks.len() + 1,
         title: title.to_string(),
+        section: section.to_string(),
+        page,
+        source: source.to_string(),
         text,
     });
 }
@@ -363,24 +458,74 @@ fn split_sentences(text: &str) -> Vec<String> {
     out
 }
 
+fn format_with_sources(answer: &str, hits: &[(f32, &Chunk)], fallback_source: &str) -> String {
+    let mut out = answer.trim().to_string();
+    let sources = format_sources(hits, fallback_source);
+    if !sources.is_empty() {
+        out.push_str("\n\n### Sources\n");
+        out.push_str(&sources);
+    }
+    out
+}
+
+fn format_sources(hits: &[(f32, &Chunk)], fallback_source: &str) -> String {
+    let mut seen = HashSet::new();
+    let mut lines = Vec::new();
+    for (_, chunk) in hits.iter().take(3) {
+        let source_name = if chunk.source.is_empty() { fallback_source } else { &chunk.source };
+        let page = chunk.page.map(|p| format!("p. {p}")).unwrap_or_else(|| "page unavailable".to_string());
+        let section = if chunk.section.is_empty() { &chunk.title } else { &chunk.section };
+        let key = format!("{source_name}|{section}|{page}");
+        if seen.insert(key) {
+            lines.push(format!("- {source_name} — {section} — {page}"));
+        }
+    }
+    lines.join("\n")
+}
+
+
 fn expand_query(q: &str) -> String {
     let n = q.to_lowercase();
     let mut extra = String::new();
+
     if n.contains("aps") || n.contains("admission point") {
-        extra.push_str(" APS admission point score method calculating excluding life orientation");
+        extra.push_str(
+            " APS admission point score method calculating excluding life orientation"
+        );
     }
+
     if n.contains("deadline") || n.contains("closing") || n.contains("due date") {
-        extra.push_str(" early closing dates application apply online keep checking website");
+        extra.push_str(
+            " early closing dates application apply online keep checking website"
+        );
     }
+
     if n.contains("fee") || n.contains("tuition") || n.contains("cost") {
-        extra.push_str(" fees discount tuition payment instalments international levy");
+        extra.push_str(
+            " fees discount tuition payment instalments international levy"
+        );
     }
+
     if n.contains("apply") || n.contains("application") {
-        extra.push_str(" online applications seven steps track apply documents");
+        extra.push_str(
+            " online applications seven steps track apply documents"
+        );
     }
-    if n.contains("module") || n.contains("subject") || n.contains("requirement") {
-        extra.push_str(" admission requirements english mathematics physical science");
+
+    if n.contains("requirement")
+        || n.contains("admission")
+        || n.contains("entry")
+        || n.contains("eligible")
+        || n.contains("qualify")
+    {
+        extra.push_str(
+            " general admission requirements minimum admission requirements \
+            individual subject admission requirements entry requirements \
+            English mathematics mathematical literacy APS selection criteria \
+            meeting minimum admission requirements does not guarantee admission"
+        );
     }
+
     format!("{q} {extra}")
 }
 
@@ -427,3 +572,4 @@ fn truncate(s: &str, n: usize) -> String {
     }
     t
 }
+

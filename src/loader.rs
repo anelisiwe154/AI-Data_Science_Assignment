@@ -9,6 +9,10 @@ pub fn project_root() -> PathBuf {
 
 pub fn load_prospectus_text() -> (String, String) {
     let root = project_root();
+    let page_text = root.join("assets").join("prospectus_pages.txt");
+    if let Ok(text) = fs::read_to_string(&page_text) {
+        return (text, "CPUT 2027 Prospectus".to_string());
+    }
     let candidates = [
         root.join("2027-Prospectus-080526.docx"),
         root.join("data").join("2027-Prospectus-080526.docx"),
